@@ -44,6 +44,35 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms))
 }
 
+/**
+ * Convert a human-readable amount (possibly fractional) into raw bigint units.
+ * Example: humanToRaw(100000, 18) -> 100000n * 10n**18n
+ * Avoids Number precision loss (Number("100000000000000000000000")/1e18 = 99999.99999999999).
+ */
+function humanToRaw(human: number, decimals: number): bigint {
+  if (!Number.isFinite(human) || human < 0) return 0n
+  // Use fixed-point string to dodge scientific notation and float artifacts
+  const s = human.toFixed(decimals)
+  const [intPart, fracPart = ''] = s.split('.')
+  const padded = intPart + fracPart.padEnd(decimals, '0').slice(0, decimals)
+  // Strip leading zeros to avoid BigInt("00") issues — but BigInt handles them; just guard empty
+  return BigInt(padded || '0')
+}
+
+/**
+ * Safely convert a raw bigint (sum of FT amounts) into a Number for display.
+ * Acceptable precision loss only for UI; never use the resulting number for thresholds.
+ */
+function rawToNumber(raw: bigint, decimals: number): number {
+  if (decimals === 0) return Number(raw)
+  const divisor = 10n ** BigInt(decimals)
+  const whole = raw / divisor
+  const frac = raw % divisor
+  // Build "<whole>.<frac>" with frac zero-padded; safe for typical token amounts.
+  const fracStr = frac.toString().padStart(decimals, '0').slice(0, 8) // 8 digits enough for UI
+  return Number(`${whole}.${fracStr}`)
+}
+
 async function fetchPage<T>(
   path: string,
   params: URLSearchParams,
@@ -201,32 +230,52 @@ export async function trackTransfers(
     if (!s.txHashes.includes(item.tx_hash)) s.txHashes.push(item.tx_hash)
   }
 
+  // FT aggregation in raw BigInt units to avoid float precision loss.
+  // (Without this, e.g. Number("100000000000000000000000")/1e18 === 99999.99999999999
+  // makes "1 NFT + exactly 100000 DARAI" combos silently fail the threshold check.)
   const ftTxCounts = new Map<string, number>()
+  const ftRawSums = new Map<string, bigint>()
+  let ftDecimals = 0
+  let ftDecimalsSet = false
   for (const item of ftItems) {
     const ts = parseBlockTimestamp(item.block_timestamp)
     const s = getOrCreate(item.sender_id, ts)
-    const normalized = Number(item.amount) / Math.pow(10, item.decimals)
-    s.tokenAmount += normalized
+    if (!ftDecimalsSet) { ftDecimals = item.decimals; ftDecimalsSet = true }
+    const prev = ftRawSums.get(item.sender_id) ?? 0n
+    ftRawSums.set(item.sender_id, prev + BigInt(item.amount))
     s.tokenSymbol = item.symbol.toUpperCase()
     if (!s.txHashes.includes(item.tx_hash)) s.txHashes.push(item.tx_hash)
     ftTxCounts.set(item.sender_id, (ftTxCounts.get(item.sender_id) ?? 0) + 1)
+  }
+  // Backfill display fields on each sender from the raw sum
+  for (const [senderId, raw] of ftRawSums.entries()) {
+    const s = senderMap.get(senderId)
+    if (!s) continue
+    s.tokenRawAmount = raw.toString()
+    s.tokenAmount = rawToNumber(raw, ftDecimals)
   }
 
   // ── Combo flag & count ──
   const hasPair2 = req.pair2Type !== 'none'
   const minNft = req.minNftCount ?? 1
   const minFt  = req.minTokenAmount ?? 0
+  const minFtRaw = ftDecimalsSet ? humanToRaw(minFt, ftDecimals) : 0n
   const hasNFT = req.pair1Type === 'nft' || req.pair2Type === 'nft'
-  const senders = [...senderMap.values()].map((s) => ({
-    ...s,
-    isCombo: hasPair2 ? s.nftCount >= minNft && s.tokenAmount >= minFt : true,
-    comboCount: hasNFT ? s.nftCount : (ftTxCounts.get(s.senderAddress) ?? 0),
-  }))
+  const senders = [...senderMap.values()].map((s) => {
+    const rawSum = BigInt(s.tokenRawAmount || '0')
+    return {
+      ...s,
+      isCombo: hasPair2 ? s.nftCount >= minNft && rawSum >= minFtRaw : true,
+      comboCount: hasNFT ? s.nftCount : (ftTxCounts.get(s.senderAddress) ?? 0),
+    }
+  })
 
   senders.sort((a, b) => b.lastTimestamp - a.lastTimestamp)
 
   const totalNFTs = senders.reduce((acc, s) => acc + s.nftCount, 0)
-  const totalTokenAmount = senders.reduce((acc, s) => acc + s.tokenAmount, 0)
+  // Sum totals in raw bigint, then convert once for display
+  const totalRaw = [...ftRawSums.values()].reduce((acc, r) => acc + r, 0n)
+  const totalTokenAmount = ftDecimalsSet ? rawToNumber(totalRaw, ftDecimals) : 0
   const comboCount = senders.filter((s) => s.isCombo).length
   const tokenSymbol =
     ftItems[0]?.symbol?.toUpperCase() ??
